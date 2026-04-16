@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(export OPENROUTER_API_KEY=\"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\")",
+      "Bash(OPENROUTER_API_KEY=\"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\" python3 fill_easy_pdf.py)",
+      "Bash(curl *)",
+      "Bash(OPENROUTER_API_KEY=\"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\" python3 fill_easy_pdf.py --model \"anthropic/claude-sonnet-4-5\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:v for k,v in d.items\\(\\) if k != 'payload'}, indent=2\\)\\); p=d.get\\('payload',{}\\); print\\('payload keys:', list\\(p.keys\\(\\)\\) if isinstance\\(p,dict\\) else type\\(p\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(OPENROUTER_API_KEY=\"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\" python3 fill_pdf.py --json-url \"https://interaction.co/assets/easy-pdf.json\" --output \"out/easy-filled-v2.pdf\" --save-original \"out/easy-original-v2.pdf\")",
+      "Bash(OPENROUTER_API_KEY=\"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\" python3 fill_pdf.py --json-url \"https://interaction.co/assets/hard-pdf.json\" --output \"out/hard-filled.pdf\" --save-original \"out/hard-original.pdf\")",
+      "Bash(chmod +x *)"
+    ]
+  }
+}
