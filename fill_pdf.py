@@ -17,13 +17,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import anthropic
 import fitz  # pymupdf
+import pytesseract
 import requests
+from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import BooleanObject, NameObject
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "anthropic/claude-sonnet-4-5"
+pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+
+DEFAULT_MODEL = "claude-sonnet-4-5"
 
 
 # ---------- Shared utilities ----------
@@ -96,7 +100,7 @@ def detect_pdf_type(pdf_bytes: bytes) -> str:
 
 def parse_json_from_text(text: str) -> Any:
     text = text.strip()
-    # Strip markdown code fences (handles multiline content inside)
+    # Strip markdown code fences
     text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n?```\s*$", "", text, flags=re.MULTILINE)
     text = text.strip()
@@ -104,37 +108,72 @@ def parse_json_from_text(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    # Try extracting the largest valid JSON object
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError("Model response did not contain a JSON object.")
-    return json.loads(match.group(0))
+    candidate = match.group(0)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        # Response was truncated — rescue complete field objects
+        fields = re.findall(r'\{[^{}]*"label"[^{}]*"value"[^{}]*\}', candidate, re.DOTALL)
+        if fields:
+            complete = [json.loads(f) for f in fields if _try_parse(f)]
+            if complete:
+                return {"fields": complete}
+        raise ValueError("Could not parse model response as JSON.")
+
+
+def _try_parse(s: str) -> bool:
+    try:
+        json.loads(s)
+        return True
+    except json.JSONDecodeError:
+        return False
 
 
 def call_openrouter(messages: list[dict], model: str, max_tokens: int = 1500) -> str:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        raise EnvironmentError("OPENROUTER_API_KEY is not set.")
+        raise EnvironmentError("ANTHROPIC_API_KEY is not set.")
 
-    response = requests.post(
-        OPENROUTER_API_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://localhost",
-            "X-Title": "pdf-autofill",
-        },
-        json={"model": model, "temperature": 0, "max_tokens": max_tokens, "messages": messages},
-        timeout=60,
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Convert OpenAI-style messages to Anthropic format
+    system = ""
+    anthropic_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system = m["content"] if isinstance(m["content"], str) else ""
+        else:
+            content = m["content"]
+            if isinstance(content, str):
+                anthropic_messages.append({"role": m["role"], "content": content})
+            elif isinstance(content, list):
+                # Vision message — convert image_url blocks to Anthropic format
+                parts = []
+                for block in content:
+                    if block.get("type") == "image_url":
+                        url = block["image_url"]["url"]
+                        if url.startswith("data:"):
+                            media_type, b64data = url.split(";base64,")
+                            media_type = media_type.split(":")[1]
+                            parts.append({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": media_type, "data": b64data},
+                            })
+                    elif block.get("type") == "text":
+                        parts.append({"type": "text", "text": block["text"]})
+                anthropic_messages.append({"role": m["role"], "content": parts})
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system,
+        messages=anthropic_messages,
     )
-    response.raise_for_status()
-    body = response.json()
-    choices = body.get("choices", [])
-    if not choices:
-        raise ValueError("OpenRouter returned no choices.")
-    content = choices[0].get("message", {}).get("content", "")
-    if not content.strip():
-        raise ValueError("OpenRouter returned empty message content.")
-    return content
+    return response.content[0].text
 
 
 # ---------- Easy path (AcroForm fields) ----------
@@ -187,76 +226,122 @@ def fill_acroform_pdf(pdf_bytes: bytes, field_values: dict[str, str], output_pat
         writer.write(f)
 
 
-# ---------- Hard path (image-based PDF) ----------
+# ---------- Hard path (fixed-layout California Bill of Sale) ----------
 
-def render_pdf_page_to_png(pdf_bytes: bytes, dpi: int = 150) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
-    return pix.tobytes("png")
+# Field layout for California DMV Bill of Sale (REG 135), bottom copy.
+# Positions are fractions of page width (x, w) and fractions of bottom-half height (y).
+# y=0.0 = top of bottom copy, y=1.0 = bottom of page.
+# Each entry: (field_key, label_for_model, x_frac, y_frac, w_frac)
+FORM_LAYOUT = [
+    ("vin",           "Vehicle Identification Number (VIN)",       0.145, 0.13, 0.125),
+    ("year",          "Year Model",                                0.285, 0.13, 0.055),
+    ("make",          "Make",                                      0.350, 0.13, 0.066),
+    ("license",       "License Plate Number",                      0.428, 0.13, 0.097),
+    ("engine",        "Motorcycle Engine Number (N/A if none)",    0.510, 0.13, 0.110),
+    ("seller_name",   "Seller Full Name (print)",                  0.020, 0.225, 0.245),
+    ("buyer_name",    "Buyer Full Name (print)",                   0.515, 0.225, 0.245),
+    ("month",         "Sale Month (2 digits)",                     0.078, 0.320, 0.036),
+    ("day",           "Sale Day (2 digits)",                       0.126, 0.320, 0.030),
+    ("year2",         "Sale Year (2 digits, e.g. 23)",             0.165, 0.320, 0.030),
+    ("price",         "Selling Price (numbers only)",              0.400, 0.320, 0.115),
+    ("relationship",  "Relationship to buyer if gift, else N/A",   0.298, 0.400, 0.135),
+    ("gift_value",    "Gift value if gift, else 0",                0.520, 0.400, 0.095),
+    ("seller_print1", "Seller Print Name (signature line 1)",      0.020, 0.510, 0.165),
+    ("seller_date1",  "Seller Date (signature line 1)",            0.213, 0.510, 0.088),
+    ("seller_dl1",    "Seller DL or Dealer Number (line 1)",       0.332, 0.510, 0.105),
+    ("seller_print2", "Seller Print Name (signature line 2)",      0.020, 0.610, 0.165),
+    ("seller_date2",  "Seller Date (signature line 2)",            0.213, 0.610, 0.088),
+    ("seller_dl2",    "Seller DL or Dealer Number (line 2)",       0.332, 0.610, 0.105),
+    ("seller_addr",   "Seller Mailing Address",                    0.020, 0.710, 0.246),
+    ("seller_city",   "Seller City",                               0.288, 0.710, 0.106),
+    ("seller_state",  "Seller State (2-letter)",                   0.408, 0.710, 0.037),
+    ("seller_zip",    "Seller ZIP Code",                           0.457, 0.710, 0.058),
+    ("seller_phone",  "Seller Daytime Phone",                      0.567, 0.710, 0.106),
+    ("buyer_print1",  "Buyer Print Name (line 1)",                 0.020, 0.800, 0.230),
+    ("buyer_print2",  "Buyer Print Name (line 2)",                 0.020, 0.873, 0.230),
+    ("buyer_addr",    "Buyer Mailing Address",                     0.020, 0.938, 0.246),
+    ("buyer_city",    "Buyer City",                                0.288, 0.938, 0.106),
+    ("buyer_state",   "Buyer State (2-letter)",                    0.408, 0.938, 0.037),
+    ("buyer_zip",     "Buyer ZIP Code",                            0.457, 0.938, 0.058),
+]
 
 
-def ask_vision_for_fields(
-    pdf_bytes: bytes, email_context: dict[str, Any], model: str
-) -> list[dict[str, Any]]:
-    png = render_pdf_page_to_png(pdf_bytes)
-    b64 = base64.b64encode(png).decode()
-
+def ask_for_field_values_layout(
+    email_context: dict[str, Any], model: str
+) -> dict[str, str]:
+    """Ask the model for values for all hardcoded layout fields."""
+    labels = {key: label for key, label, *_ in FORM_LAYOUT}
     messages = [
         {
             "role": "system",
             "content": (
-                "You analyze a scanned PDF form image and return filled values with positions. "
-                "Return only a JSON object with a 'fields' array. "
-                "Each item must have: "
-                "'label' (short field description), "
-                "'value' (text to fill in — never empty, use plausible placeholders if unknown), "
-                "'x' (0.0–1.0, normalized horizontal position where text should start), "
-                "'y' (0.0–1.0, normalized vertical position — 0 is top of page). "
-                "Use the email context to infer names, dates, and addresses."
+                "You fill a California DMV Bill of Sale form. "
+                "Return ONLY a JSON object mapping each field key to its value. "
+                "Use the email context for names/addresses. "
+                "Invent plausible placeholders for unknown fields. Never use empty strings."
             ),
         },
         {
             "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                {
-                    "type": "text",
-                    "text": json.dumps({
-                        "email_context": email_context,
-                        "instructions": (
-                            "Identify every blank field in this form. "
-                            "Return filled values and normalized x/y positions for each. "
-                            "No markdown, no explanation — only the JSON object."
-                        ),
-                    }),
-                },
-            ],
+            "content": json.dumps({
+                "email_context": email_context,
+                "fields": labels,
+                "instructions": "Return a flat JSON object: {field_key: value}. No markdown.",
+            }),
         },
     ]
-
-    raw = call_openrouter(messages, model, max_tokens=3000)
+    raw = call_openrouter(messages, model, max_tokens=1500)
     parsed = parse_json_from_text(raw)
-    fields = parsed.get("fields", [])
-    if not isinstance(fields, list):
-        raise ValueError("Vision model response missing 'fields' array.")
-    return fields
+    return {str(k): str(v) for k, v in parsed.items()}
 
 
-def overlay_text_on_pdf(
-    pdf_bytes: bytes, fields: list[dict[str, Any]], output_path: Path
-) -> None:
+def ask_vision_for_fields(
+    pdf_bytes: bytes, email_context: dict[str, Any], model: str
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Build field list from hardcoded layout + model-supplied values."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
     pw, ph = page.rect.width, page.rect.height
+
+    values = ask_for_field_values_layout(email_context, model)
+
+    fields = []
+    for key, label, x_frac, y_frac, w_frac in FORM_LAYOUT:
+        value = values.get(key, "").strip()
+        if not value:
+            continue
+        # Convert fractions to absolute PDF points
+        x = x_frac * pw
+        y = ph / 2 + y_frac * (ph / 2)  # offset into bottom half
+        w = w_frac * pw
+        fields.append({"label": label, "value": value, "x": x, "y_baseline": y, "w": w})
+
+    # img_w/img_h not used when coords are already in PDF points
+    return fields, pw, ph
+
+
+def overlay_text_on_pdf(
+    pdf_bytes: bytes,
+    fields: list[dict[str, Any]],
+    img_w: float,
+    img_h: float,
+    output_path: Path,
+) -> None:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    FIELD_H = 11.0  # points to white out above baseline
 
     for field in fields:
         value = str(field.get("value", "")).strip()
         if not value:
             continue
-        x = float(field.get("x", 0)) * pw
-        y = float(field.get("y", 0)) * ph
-        page.insert_text(fitz.Point(x, y), value, fontsize=9, color=(0, 0, 0.7))
+        x = field["x"]
+        y = field["y_baseline"]
+        w = field["w"]
+
+        # White out the blank area
+        page.draw_rect(fitz.Rect(x, y - FIELD_H, x + w, y + 1), color=(1, 1, 1), fill=(1, 1, 1))
+        page.insert_text(fitz.Point(x + 1, y - 2), value, fontsize=8.5, color=(0, 0, 0))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
@@ -311,8 +396,8 @@ def main() -> int:
             if args.list_fields_only:
                 print("Image-based PDF — use vision call to discover fields (omit --list-fields-only).")
                 return 0
-            vision_fields = ask_vision_for_fields(pdf_bytes, email_context, args.model)
-            overlay_text_on_pdf(pdf_bytes, vision_fields, output_path)
+            vision_fields, img_w, img_h = ask_vision_for_fields(pdf_bytes, email_context, args.model)
+            overlay_text_on_pdf(pdf_bytes, vision_fields, img_w, img_h, output_path)
             print(f"Filled PDF saved to: {output_path}")
             print("Fields overlaid:")
             for f in vision_fields:

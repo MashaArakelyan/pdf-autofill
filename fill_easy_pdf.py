@@ -19,14 +19,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import anthropic
 import requests
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import BooleanObject, NameObject
 
 
 DEFAULT_JSON_URL = "https://interaction.co/assets/easy-pdf.json"
-DEFAULT_OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_OPENROUTER_MODEL = "claude-sonnet-4-5"
 
 
 def fetch_json(url: str, verify_ssl: bool = True) -> dict[str, Any]:
@@ -123,65 +123,33 @@ def ask_openrouter_for_field_values(
     model: str = DEFAULT_OPENROUTER_MODEL,
     verify_ssl: bool = True,
 ) -> dict[str, str]:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        raise EnvironmentError("OPENROUTER_API_KEY is not set.")
+        raise EnvironmentError("ANTHROPIC_API_KEY is not set.")
 
-    system_prompt = (
-        "You fill PDF form fields using provided context and reasonable inferences. "
-        "Return only a compact JSON object mapping exact field names to values. "
-        "For fields inferable from the email (names, dates, addresses), use those values. "
-        "For fields with no context (IDs, plate numbers, prices), invent plausible placeholder values. "
-        "Never leave a field empty — always provide a best-effort value."
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model,
+        max_tokens=1200,
+        system=(
+            "You fill PDF form fields using provided context and reasonable inferences. "
+            "Return only a compact JSON object mapping exact field names to values. "
+            "For fields inferable from the email (names, dates, addresses), use those values. "
+            "For fields with no context (IDs, plate numbers, prices), invent plausible placeholder values. "
+            "Never leave a field empty — always provide a best-effort value."
+        ),
+        messages=[{"role": "user", "content": json.dumps({
+            "email_context": email_context,
+            "field_names": field_names,
+            "requirements": [
+                "Use exact field names as JSON keys.",
+                "Fill ALL fields with best-effort or placeholder values — no empty strings.",
+                "Infer seller/buyer names from the email sender/recipient where applicable.",
+                "Do not include explanation, markdown, or extra text.",
+            ],
+        })}],
     )
-
-    user_prompt = {
-        "email_context": email_context,
-        "field_names": field_names,
-        "requirements": [
-            "Use exact field names as JSON keys.",
-            "Fill ALL fields with best-effort or placeholder values — no empty strings.",
-            "Infer seller/buyer names from the email sender/recipient where applicable.",
-            "Do not include explanation, markdown, or extra text.",
-        ],
-    }
-
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": 1200,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_prompt)},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        # Optional but recommended by OpenRouter for app identification.
-        "HTTP-Referer": "https://localhost",
-        "X-Title": "easy-pdf-autofill",
-    }
-
-    response = requests.post(
-        OPENROUTER_API_URL,
-        headers=headers,
-        json=payload,
-        timeout=60,
-        verify=verify_ssl,
-    )
-    response.raise_for_status()
-    body = response.json()
-
-    choices = body.get("choices", [])
-    if not choices:
-        raise ValueError("OpenRouter returned no choices.")
-
-    message_content = choices[0].get("message", {}).get("content", "")
-    if not isinstance(message_content, str) or not message_content.strip():
-        raise ValueError("OpenRouter returned empty message content.")
-
-    return parse_json_from_text(message_content)
+    return parse_json_from_text(response.content[0].text)
 
 
 def fill_pdf_form(pdf_bytes: bytes, field_values: dict[str, str], output_path: Path) -> None:
@@ -204,7 +172,11 @@ def fill_pdf_form(pdf_bytes: bytes, field_values: dict[str, str], output_path: P
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fill the easy PDF challenge form with OpenRouter.")
-    parser.add_argument("--json-url", required=True, help="Source JSON URL")
+    parser.add_argument(
+        "--json-url",
+        default=DEFAULT_JSON_URL,
+        help=f"Source JSON URL (default: {DEFAULT_JSON_URL})",
+    )
     parser.add_argument(
         "--output",
         default="out/easy-filled.pdf",
@@ -269,6 +241,8 @@ def main() -> int:
         print("Discovered fields:")
         for name in fields:
             print(f" - {name}: {normalized_values.get(name, '')}")
+        import subprocess
+        subprocess.run(["open", str(output_path)])
         return 0
     except Exception as exc:  # broad catch for challenge scripting speed
         print(f"Error: {exc}", file=sys.stderr)

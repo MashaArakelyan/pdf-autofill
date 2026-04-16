@@ -29,7 +29,13 @@ Outputs:
 ## Useful options
 
 ```bash
-python fill_easy_pdf.py --output out/my-filled.pdf --model claude-3-5-sonnet-latest
+python fill_easy_pdf.py --output out/my-filled.pdf --model anthropic/claude-3.5-sonnet
+```
+
+To point at a different challenge JSON:
+
+```bash
+python fill_easy_pdf.py --json-url "https://interaction.co/assets/easy-pdf.json"
 ```
 
 Example OpenRouter model names:
